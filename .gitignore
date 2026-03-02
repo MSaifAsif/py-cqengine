@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Maturin
+*.pyc
+.maturin/
+
+# Build artifacts
+*.dylib
+*.pyd
+*.dll
+
+# Documentation
+docs/_build/
+site/
+
+# Test outputs
+.benchmarks/
+benchmark_results/
