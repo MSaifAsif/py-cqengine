@@ -1,0 +1,28 @@
+[package]
+name = "pycqengine"
+version = "0.1.0"
+edition = "2021"
+authors = ["Saif Asif <saif@example.com>"]
+description = "High-performance in-memory NoSQL indexing engine for Python object collections"
+license = "MIT"
+repository = "https://github.com/yourusername/py-cqengine"
+keywords = ["query", "index", "nosql", "search", "performance"]
+categories = ["database", "data-structures"]
+
+[lib]
+name = "pycqengine_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py311"] }
+dashmap = "6.1"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+lru = "0.12"
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
