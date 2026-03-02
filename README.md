@@ -2,6 +2,8 @@
 
 High-performance in-memory NoSQL indexing engine for Python object collections, powered by Rust.
 
+> The project is in development phase and is provided as-is for now.
+
 **Performance:** Sub-microsecond point lookups. 100x+ faster than list comprehensions for selective queries on 1,000,000+ objects.
 
 ## Features
