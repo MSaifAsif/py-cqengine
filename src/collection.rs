@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use lru::LruCache;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
+use pyo3::types::PyWeakrefReference;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
@@ -88,7 +89,7 @@ impl IndexKind {
 /// Maintains object registry and manages indexes
 #[pyclass]
 pub struct CollectionManager {
-    // Object ID -> Python object reference
+    // Object ID -> Python object reference (or weakref in weak mode)
     objects: Arc<DashMap<u64, PyObject>>,
     
     // Attribute name -> Index implementation (Hash or BTree)
@@ -96,18 +97,28 @@ pub struct CollectionManager {
     
     // Query result cache (LRU with 1000 entries)
     query_cache: Arc<Mutex<LruCache<CacheKey, Vec<u64>>>>,
+
+    // Whether to store weak references instead of strong ones
+    use_weakrefs: bool,
+
+    // Reverse index: object_id -> [(attr_name, typed_value)] for gc() cleanup
+    // Only populated when use_weakrefs=true
+    reverse_index: Arc<DashMap<u64, Vec<(String, TypedValue)>>>,
 }
 
 #[pymethods]
 impl CollectionManager {
     #[new]
-    pub fn new() -> Self {
+    #[pyo3(signature = (use_weakrefs=false))]
+    pub fn new(use_weakrefs: bool) -> Self {
         Self {
             objects: Arc::new(DashMap::new()),
             indexes: Arc::new(DashMap::new()),
             query_cache: Arc::new(Mutex::new(
                 LruCache::new(NonZeroUsize::new(1000).unwrap())
             )),
+            use_weakrefs,
+            reverse_index: Arc::new(DashMap::new()),
         }
     }
 
@@ -135,17 +146,36 @@ impl CollectionManager {
     ) -> PyResult<()> {
         let object_id = obj.as_ptr() as u64;
         
-        // Store the object reference
-        self.objects.insert(object_id, obj);
+        // Convert attribute values to typed
+        let mut typed_attrs: Vec<(String, TypedValue)> = Vec::new();
+        for (attr_name, value) in &attributes {
+            if self.indexes.contains_key(attr_name) {
+                let tv = TypedValue::from_py(value)?;
+                typed_attrs.push((attr_name.clone(), tv));
+            }
+        }
+
+        // Store the object reference (strong or weak)
+        if self.use_weakrefs {
+            // Check for dead ref at same address (address reuse cleanup)
+            self.maybe_cleanup_dead_ref(py, object_id);
+            // Try to create weakref; fall back to strong ref
+            let stored = match PyWeakrefReference::new(obj.bind(py)) {
+                Ok(weakref) => weakref.unbind().into(),
+                Err(_) => obj,
+            };
+            self.objects.insert(object_id, stored);
+            self.reverse_index.insert(object_id, typed_attrs.clone());
+        } else {
+            self.objects.insert(object_id, obj);
+        }
         
         // Update all indexes
-        for (attr_name, value) in attributes {
-            if let Some(index) = self.indexes.get(&attr_name) {
-                let typed_value = TypedValue::from_py(&value)?;
-                
-                // Release GIL during index operations for better concurrency
+        for (attr_name, typed_value) in &typed_attrs {
+            if let Some(index) = self.indexes.get(attr_name) {
+                let tv = typed_value.clone();
                 py.allow_threads(|| {
-                    index.as_index().insert(typed_value, object_id);
+                    index.as_index().insert(tv, object_id);
                 });
             }
         }
@@ -178,7 +208,19 @@ impl CollectionManager {
                     typed_attrs.push((attr_name, typed_value));
                 }
             }
-            self.objects.insert(object_id, obj);
+
+            if self.use_weakrefs {
+                self.maybe_cleanup_dead_ref(py, object_id);
+                let stored = match PyWeakrefReference::new(obj.bind(py)) {
+                    Ok(weakref) => weakref.unbind().into(),
+                    Err(_) => obj,
+                };
+                self.objects.insert(object_id, stored);
+                self.reverse_index.insert(object_id, typed_attrs.clone());
+            } else {
+                self.objects.insert(object_id, obj);
+            }
+
             index_entries.push((object_id, typed_attrs));
         }
 
@@ -238,13 +280,7 @@ impl CollectionManager {
             index.as_index().lookup_first(&typed_value, limit)
         });
         
-        // Materialize objects directly
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                self.objects.get(id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        self.ids_to_objects(py, &ids)
     }
 
     /// Query for object IDs matching a specific attribute value (with caching)
@@ -286,12 +322,7 @@ impl CollectionManager {
     /// Fused eq query + object materialization in a single FFI call.
     pub fn query_eq_objects(&self, py: Python<'_>, attribute: String, value: Bound<'_, PyAny>) -> PyResult<Vec<PyObject>> {
         let ids = self.query_eq(py, attribute, value)?;
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                self.objects.get(id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        self.ids_to_objects(py, &ids)
     }
 
     /// Query with AND logic (intersection) - performs set operations in Rust (with caching)
@@ -381,12 +412,7 @@ impl CollectionManager {
         queries: Vec<(String, Bound<'_, PyAny>)>,
     ) -> PyResult<Vec<PyObject>> {
         let ids = self.query_and(py, queries)?;
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                self.objects.get(id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        self.ids_to_objects(py, &ids)
     }
 
     /// General AND query supporting mixed query types (eq, gt, gte, lt, lte, between).
@@ -554,12 +580,7 @@ impl CollectionManager {
         queries: Vec<(String, Bound<'_, PyAny>)>,
     ) -> PyResult<Vec<PyObject>> {
         let ids = self.query_or(py, queries)?;
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                self.objects.get(id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        self.ids_to_objects(py, &ids)
     }
 
     /// Query with IN logic (optimized union for single attribute) (with caching)
@@ -634,12 +655,7 @@ impl CollectionManager {
         values: Vec<Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PyObject>> {
         let ids = self.query_in(py, attribute, values)?;
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                self.objects.get(id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        self.ids_to_objects(py, &ids)
     }
 
     // ── Range query methods ───────────────────────────────────────────
@@ -741,16 +757,9 @@ impl CollectionManager {
 
     // ── Object retrieval ────────────────────────────────────────────
 
-    /// Retrieve Python objects by their IDs (optimized: functional iterator pattern)
+    /// Retrieve Python objects by their IDs (optimized: uses resolve_object for weakref support)
     pub fn get_objects(&self, py: Python<'_>, object_ids: Vec<u64>) -> PyResult<Vec<PyObject>> {
-        // Use functional iteration for better compiler optimization
-        // filter_map avoids conditional branches
-        Ok(object_ids
-            .into_iter()
-            .filter_map(|id| {
-                self.objects.get(&id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        self.ids_to_objects(py, &object_ids)
     }
 
     /// Retrieve a slice of Python objects by their IDs (for pagination)
@@ -766,13 +775,7 @@ impl CollectionManager {
         if start >= end {
             return Ok(Vec::new());
         }
-        
-        Ok(object_ids[start..end]
-            .iter()
-            .filter_map(|id| {
-                self.objects.get(id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        self.ids_to_objects(py, &object_ids[start..end])
     }
 
     /// Get the total number of objects in the collection
@@ -783,6 +786,7 @@ impl CollectionManager {
     /// Clear all objects and indexes (also clears query cache)
     pub fn clear(&self) {
         self.objects.clear();
+        self.reverse_index.clear();
         for index in self.indexes.iter() {
             index.value().as_index().clear();
         }
@@ -798,6 +802,57 @@ impl CollectionManager {
     pub fn cache_stats(&self) -> (usize, usize) {
         let cache = self.query_cache.lock();
         (cache.len(), cache.cap().get())
+    }
+
+    /// Whether this collection uses weak references
+    #[getter]
+    pub fn use_weakrefs(&self) -> bool {
+        self.use_weakrefs
+    }
+
+    /// Count alive objects (checks weakrefs in weak_refs mode)
+    pub fn alive_count(&self, py: Python<'_>) -> usize {
+        if !self.use_weakrefs {
+            return self.objects.len();
+        }
+        self.objects.iter()
+            .filter(|entry| {
+                let bound = entry.value().bind(py);
+                match bound.downcast::<PyWeakrefReference>() {
+                    Ok(weakref) => weakref.upgrade().is_some(),
+                    Err(_) => true, // strong ref fallback
+                }
+            })
+            .count()
+    }
+
+    /// Garbage-collect dead weak references and clean their index entries.
+    /// Returns the number of dead references cleaned.
+    /// No-op in strong-ref mode.
+    pub fn gc(&self, py: Python<'_>) -> usize {
+        if !self.use_weakrefs {
+            return 0;
+        }
+
+        let mut dead_ids: Vec<u64> = Vec::new();
+        for entry in self.objects.iter() {
+            let id = *entry.key();
+            let bound = entry.value().bind(py);
+            if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
+                if weakref.upgrade().is_none() {
+                    dead_ids.push(id);
+                }
+            }
+        }
+
+        let count = dead_ids.len();
+        for id in &dead_ids {
+            self.cleanup_single_dead_ref(*id);
+        }
+        if count > 0 {
+            self.query_cache.lock().clear();
+        }
+        count
     }
 
     /// Remove a single object from the collection and all indexes
@@ -828,6 +883,11 @@ impl CollectionManager {
 
         // Remove from object store (GIL held for safe PyObject drop)
         let removed = self.objects.remove(&object_id).is_some();
+
+        // Remove from reverse index
+        if self.use_weakrefs {
+            self.reverse_index.remove(&object_id);
+        }
 
         // Invalidate cache
         self.query_cache.lock().clear();
@@ -874,6 +934,9 @@ impl CollectionManager {
         for (object_id, _) in &typed_batch {
             if self.objects.remove(object_id).is_some() {
                 count += 1;
+            }
+            if self.use_weakrefs {
+                self.reverse_index.remove(object_id);
             }
         }
 
@@ -926,15 +989,78 @@ impl CollectionManager {
         Ok(result)
     }
 
-    /// Shared helper: convert IDs to Python objects
+    /// Shared helper: convert IDs to Python objects (with weakref support + pre-allocation)
     #[inline]
     fn ids_to_objects(&self, py: Python<'_>, ids: &[u64]) -> PyResult<Vec<PyObject>> {
-        Ok(ids
-            .iter()
-            .filter_map(|id| {
-                self.objects.get(id).map(|entry| entry.value().clone_ref(py))
-            })
-            .collect())
+        let mut result = Vec::with_capacity(ids.len());
+
+        if self.use_weakrefs {
+            let mut dead_ids: Vec<u64> = Vec::new();
+            for &id in ids {
+                match self.resolve_object(py, id) {
+                    Some(obj) => result.push(obj),
+                    None => dead_ids.push(id),
+                }
+            }
+            // Lazy cleanup: remove dead weakrefs from objects + indexes
+            if !dead_ids.is_empty() {
+                for &id in &dead_ids {
+                    self.cleanup_single_dead_ref(id);
+                }
+                self.query_cache.lock().clear();
+            }
+        } else {
+            for &id in ids {
+                if let Some(entry) = self.objects.get(&id) {
+                    result.push(entry.value().clone_ref(py));
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Resolve a single object ID → PyObject, handling both strong refs and weakrefs.
+    /// Returns None if the weakref is dead (object has been GC'd).
+    #[inline]
+    fn resolve_object(&self, py: Python<'_>, id: u64) -> Option<PyObject> {
+        let entry = self.objects.get(&id)?;
+        let stored = entry.value();
+
+        if self.use_weakrefs {
+            let bound = stored.bind(py);
+            if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
+                return weakref.upgrade().map(|obj| obj.unbind());
+            }
+        }
+        // Strong ref path (default, or fallback for objects that don't support weakrefs)
+        Some(stored.clone_ref(py))
+    }
+
+    /// Remove a dead ref from the object store + all its index entries using the reverse index.
+    fn cleanup_single_dead_ref(&self, id: u64) {
+        self.objects.remove(&id);
+        if let Some((_, attrs)) = self.reverse_index.remove(&id) {
+            for (attr_name, typed_value) in &attrs {
+                if let Some(index) = self.indexes.get(attr_name) {
+                    index.as_index().remove(typed_value, id);
+                }
+            }
+        }
+    }
+
+    /// Check if there's a dead weakref at the given ID and clean it up.
+    /// Used during add_object to handle address reuse.
+    fn maybe_cleanup_dead_ref(&self, py: Python<'_>, id: u64) {
+        if let Some(entry) = self.objects.get(&id) {
+            let bound = entry.value().bind(py);
+            if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
+                if weakref.upgrade().is_none() {
+                    drop(entry);
+                    self.cleanup_single_dead_ref(id);
+                }
+            }
+        }
     }
 
     /// Parse a list of Python query spec tuples into QuerySpec enums.
@@ -1021,6 +1147,6 @@ impl CollectionManager {
 
 impl Default for CollectionManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(false)
     }
 }

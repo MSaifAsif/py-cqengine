@@ -18,6 +18,7 @@ High-performance in-memory NoSQL indexing engine for Python object collections, 
 - **🗑️ Memory Lifecycle**: `remove()`, `remove_many()`, `clear()`, `__del__` support
 - **🎯 Zero-Cost Counting**: `count()` and `first(n)` without materializing objects
 - **💾 LRU Query Cache**: Automatic caching of repeated queries (1,000 entries)
+- **🔗 Weak References**: Opt-in `use_weakrefs=True` mode — objects auto-cleaned when Python GC'd
 
 ## Architecture
 
@@ -187,6 +188,39 @@ cars.remove_many([car1, car2, car3])
 cars.clear()
 ```
 
+### Weak References
+
+By default, `IndexedCollection` holds **strong references** to objects, keeping them alive as long as the collection exists. Enable weak reference mode to let Python's GC reclaim objects when no other references exist:
+
+```python
+# Opt-in weak reference mode
+cars = IndexedCollection(use_weakrefs=True)
+cars.add_index(BRAND)
+cars.add_index(PRICE, index_type="btree")
+
+car = Car(1, "Tesla", 50000)
+cars.add(car)
+
+# Object is retrievable while reference exists
+assert list(cars.retrieve(eq(BRAND, "Tesla"))) == [car]
+
+# Drop the reference — Python GC can reclaim it
+del car
+
+# Explicit garbage collection
+cleaned = cars.gc()       # Returns number of dead refs cleaned
+print(cars.alive_count)   # Number of still-alive objects
+
+# Dead refs are also cleaned lazily during queries
+results = list(cars.retrieve(eq(BRAND, "Tesla")))  # Returns [] — dead ref auto-cleaned
+```
+
+**Notes:**
+- Objects that don't support weakrefs (tuples, ints, etc.) automatically fall back to strong refs
+- Query performance has **zero overhead** in weakref mode
+- Build throughput is ~13% slower (weakref creation + reverse index population)
+- `gc()` and `alive_count` scan all objects — suitable for periodic maintenance, not hot loops
+
 ## Performance
 
 Benchmarked on macOS ARM64 (Apple Silicon), Python 3.14, Rust 1.93.
@@ -243,7 +277,7 @@ py-cqengine/
 │   ├── core.py            # IndexedCollection + ResultSet
 │   ├── attribute.py       # Attribute extractor
 │   └── query.py           # Query DSL (eq, and_, or_, in_, gt, between...)
-├── tests/                 # Python tests (95 tests)
+├── tests/                 # Python tests (119 tests)
 ├── benchmarks/            # Performance benchmarks
 ├── Cargo.toml             # Rust dependencies
 └── pyproject.toml         # Python package config

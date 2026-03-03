@@ -198,10 +198,19 @@ class IndexedCollection:
         1 Tesla
     """
     
-    def __init__(self):
-        """Initialize an empty indexed collection"""
-        self._manager = CollectionManager()
+    def __init__(self, use_weakrefs: bool = False):
+        """Initialize an empty indexed collection.
+        
+        Args:
+            use_weakrefs: If True, store weak references to objects instead of
+                strong references. Objects that are no longer referenced elsewhere
+                will be automatically cleaned up during gc() or lazily during
+                queries. Objects that don't support weakrefs (e.g. built-in types)
+                fall back to strong references automatically.
+        """
+        self._manager = CollectionManager(use_weakrefs)
         self._indexes = {}  # attribute name -> Attribute
+        self._use_weakrefs = use_weakrefs
     
     def add_index(self, attribute: Attribute, index_type: str = "hash") -> None:
         """
@@ -344,3 +353,28 @@ class IndexedCollection:
     def clear(self) -> None:
         """Remove all objects and clear all indexes, freeing memory"""
         self._manager.clear()
+
+    def gc(self) -> int:
+        """Garbage-collect dead weak references and clean their index entries.
+        
+        Only meaningful when use_weakrefs=True. In strong-ref mode this is a no-op
+        returning 0.
+        
+        Returns:
+            Number of dead references cleaned up
+        """
+        return self._manager.gc()
+
+    @property
+    def alive_count(self) -> int:
+        """Number of objects still alive in the collection.
+        
+        In strong-ref mode this equals len(). In weak-ref mode, this checks
+        each stored weak reference and counts only the still-alive ones.
+        """
+        return self._manager.alive_count()
+
+    @property
+    def use_weakrefs(self) -> bool:
+        """Whether this collection stores weak references."""
+        return self._use_weakrefs
