@@ -157,10 +157,12 @@ class ResultSet:
         """
         Check if an object is in the result set.
         
-        Uses object ID comparison — requires query execution but no materialization.
+        Uses internal slot ID comparison — requires query execution but no materialization.
         """
-        obj_id = id(obj)
-        return obj_id in self._ensure_ids()
+        slot = self._manager.object_slot(obj)
+        if slot is None:
+            return False
+        return slot in self._ensure_ids()
     
     def __repr__(self) -> str:
         return f"ResultSet(size={self.count()})"

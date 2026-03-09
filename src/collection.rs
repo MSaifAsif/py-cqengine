@@ -85,12 +85,95 @@ impl IndexKind {
     }
 }
 
+/// Dense object storage for cache-friendly materialization.
+/// All access is GIL-protected, so a single Mutex suffices.
+struct DenseStore {
+    /// Object storage indexed by slot ID. None = vacant slot.
+    slots: Vec<Option<PyObject>>,
+    /// Parallel to slots: ptr-based ID (obj.as_ptr() as u64) at each slot.
+    slot_ptrs: Vec<u64>,
+    /// Maps Python object ptr → slot index.
+    ptr_to_slot: HashMap<u64, u32>,
+    /// Recycled slot indices from remove operations.
+    free_list: Vec<u32>,
+    /// Number of live objects.
+    count: usize,
+}
+
+impl DenseStore {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            slot_ptrs: Vec::new(),
+            ptr_to_slot: HashMap::new(),
+            free_list: Vec::new(),
+            count: 0,
+        }
+    }
+
+    /// Allocate a slot and store the object. Returns the slot index.
+    fn insert(&mut self, ptr_id: u64, obj: PyObject) -> u32 {
+        let slot = if let Some(s) = self.free_list.pop() {
+            s
+        } else {
+            let s = self.slots.len() as u32;
+            self.slots.push(None);
+            self.slot_ptrs.push(0);
+            s
+        };
+        self.slots[slot as usize] = Some(obj);
+        self.slot_ptrs[slot as usize] = ptr_id;
+        self.ptr_to_slot.insert(ptr_id, slot);
+        self.count += 1;
+        slot
+    }
+
+    /// Remove by ptr_id. Returns the slot index if found.
+    fn remove(&mut self, ptr_id: u64) -> Option<u32> {
+        if let Some(slot) = self.ptr_to_slot.remove(&ptr_id) {
+            self.slots[slot as usize] = None;
+            self.free_list.push(slot);
+            self.count -= 1;
+            Some(slot)
+        } else {
+            None
+        }
+    }
+
+    /// Remove by slot index. Returns the ptr_id if found.
+    fn remove_by_slot(&mut self, slot: u32) -> Option<u64> {
+        let idx = slot as usize;
+        if idx < self.slots.len() && self.slots[idx].is_some() {
+            self.slots[idx] = None;
+            let ptr_id = self.slot_ptrs[idx];
+            self.ptr_to_slot.remove(&ptr_id);
+            self.free_list.push(slot);
+            self.count -= 1;
+            Some(ptr_id)
+        } else {
+            None
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.slot_ptrs.clear();
+        self.ptr_to_slot.clear();
+        self.free_list.clear();
+        self.count = 0;
+    }
+}
+
 /// Central collection manager for Python objects
 /// Maintains object registry and manages indexes
 #[pyclass]
 pub struct CollectionManager {
-    // Object ID -> Python object reference (or weakref in weak mode)
-    objects: Arc<DashMap<u64, PyObject>>,
+    // Dense object storage (slot-indexed Vec behind Mutex)
+    store: Mutex<DenseStore>,
     
     // Attribute name -> Index implementation (Hash or BTree)
     indexes: Arc<DashMap<String, IndexKind>>,
@@ -101,7 +184,7 @@ pub struct CollectionManager {
     // Whether to store weak references instead of strong ones
     use_weakrefs: bool,
 
-    // Reverse index: object_id -> [(attr_name, typed_value)] for gc() cleanup
+    // Reverse index: slot_id -> [(attr_name, typed_value)] for gc() cleanup
     // Only populated when use_weakrefs=true
     reverse_index: Arc<DashMap<u64, Vec<(String, TypedValue)>>>,
 }
@@ -112,7 +195,7 @@ impl CollectionManager {
     #[pyo3(signature = (use_weakrefs=false))]
     pub fn new(use_weakrefs: bool) -> Self {
         Self {
-            objects: Arc::new(DashMap::new()),
+            store: Mutex::new(DenseStore::new()),
             indexes: Arc::new(DashMap::new()),
             query_cache: Arc::new(Mutex::new(
                 LruCache::new(NonZeroUsize::new(1000).unwrap())
@@ -144,7 +227,7 @@ impl CollectionManager {
         obj: PyObject,
         attributes: HashMap<String, Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let object_id = obj.as_ptr() as u64;
+        let ptr_id = obj.as_ptr() as u64;
         
         // Convert attribute values to typed
         let mut typed_attrs: Vec<(String, TypedValue)> = Vec::new();
@@ -155,27 +238,51 @@ impl CollectionManager {
             }
         }
 
-        // Store the object reference (strong or weak)
-        if self.use_weakrefs {
-            // Check for dead ref at same address (address reuse cleanup)
-            self.maybe_cleanup_dead_ref(py, object_id);
-            // Try to create weakref; fall back to strong ref
-            let stored = match PyWeakrefReference::new(obj.bind(py)) {
-                Ok(weakref) => weakref.unbind().into(),
-                Err(_) => obj,
-            };
-            self.objects.insert(object_id, stored);
-            self.reverse_index.insert(object_id, typed_attrs.clone());
-        } else {
-            self.objects.insert(object_id, obj);
-        }
+        // Allocate slot and store object
+        let slot_id: u64 = {
+            let mut store = self.store.lock();
+            if self.use_weakrefs {
+                // Check for dead ref at same address (address reuse cleanup)
+                if let Some(&old_slot) = store.ptr_to_slot.get(&ptr_id) {
+                    let is_dead = store.slots.get(old_slot as usize)
+                        .and_then(|s| s.as_ref())
+                        .map(|obj| {
+                            let bound = obj.bind(py);
+                            bound.downcast::<PyWeakrefReference>()
+                                .map(|w| w.upgrade().is_none())
+                                .unwrap_or(false)
+                        })
+                        .unwrap_or(false);
+                    if is_dead {
+                        let old_slot_id = old_slot as u64;
+                        store.remove_by_slot(old_slot);
+                        if let Some((_, attrs)) = self.reverse_index.remove(&old_slot_id) {
+                            for (attr_name, typed_value) in &attrs {
+                                if let Some(index) = self.indexes.get(attr_name) {
+                                    index.as_index().remove(typed_value, old_slot_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                let stored = match PyWeakrefReference::new(obj.bind(py)) {
+                    Ok(weakref) => weakref.unbind().into(),
+                    Err(_) => obj,
+                };
+                let slot = store.insert(ptr_id, stored);
+                self.reverse_index.insert(slot as u64, typed_attrs.clone());
+                slot as u64
+            } else {
+                store.insert(ptr_id, obj) as u64
+            }
+        };
         
-        // Update all indexes
+        // Update all indexes with slot ID
         for (attr_name, typed_value) in &typed_attrs {
             if let Some(index) = self.indexes.get(attr_name) {
                 let tv = typed_value.clone();
                 py.allow_threads(|| {
-                    index.as_index().insert(tv, object_id);
+                    index.as_index().insert(tv, slot_id);
                 });
             }
         }
@@ -197,40 +304,70 @@ impl CollectionManager {
         }
 
         // Phase 1: Extract typed values and store objects (sequential, needs GIL)
-        let mut index_entries: Vec<(u64, Vec<(String, TypedValue)>)> = Vec::with_capacity(objects.len());
+        let index_entries: Vec<(u64, Vec<(String, TypedValue)>)>;
 
-        for (obj, attributes) in objects {
-            let object_id = obj.as_ptr() as u64;
-            let mut typed_attrs = Vec::new();
-            for (attr_name, value) in attributes {
-                if self.indexes.contains_key(&attr_name) {
-                    let typed_value = TypedValue::from_py(&value)?;
-                    typed_attrs.push((attr_name, typed_value));
+        {
+            let mut store = self.store.lock();
+            let mut entries = Vec::with_capacity(objects.len());
+
+            for (obj, attributes) in objects {
+                let ptr_id = obj.as_ptr() as u64;
+                let mut typed_attrs = Vec::new();
+                for (attr_name, value) in attributes {
+                    if self.indexes.contains_key(&attr_name) {
+                        let typed_value = TypedValue::from_py(&value)?;
+                        typed_attrs.push((attr_name, typed_value));
+                    }
                 }
-            }
 
-            if self.use_weakrefs {
-                self.maybe_cleanup_dead_ref(py, object_id);
-                let stored = match PyWeakrefReference::new(obj.bind(py)) {
-                    Ok(weakref) => weakref.unbind().into(),
-                    Err(_) => obj,
+                let slot = if self.use_weakrefs {
+                    // Inline dead-ref cleanup while holding store lock
+                    if let Some(&old_slot) = store.ptr_to_slot.get(&ptr_id) {
+                        let is_dead = store.slots.get(old_slot as usize)
+                            .and_then(|s| s.as_ref())
+                            .map(|obj| {
+                                let bound = obj.bind(py);
+                                bound.downcast::<PyWeakrefReference>()
+                                    .map(|w| w.upgrade().is_none())
+                                    .unwrap_or(false)
+                            })
+                            .unwrap_or(false);
+                        if is_dead {
+                            let old_slot_id = old_slot as u64;
+                            store.remove_by_slot(old_slot);
+                            if let Some((_, attrs)) = self.reverse_index.remove(&old_slot_id) {
+                                for (attr_name, typed_value) in &attrs {
+                                    if let Some(index) = self.indexes.get(attr_name) {
+                                        index.as_index().remove(typed_value, old_slot_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let stored = match PyWeakrefReference::new(obj.bind(py)) {
+                        Ok(weakref) => weakref.unbind().into(),
+                        Err(_) => obj,
+                    };
+                    let s = store.insert(ptr_id, stored);
+                    self.reverse_index.insert(s as u64, typed_attrs.clone());
+                    s
+                } else {
+                    store.insert(ptr_id, obj)
                 };
-                self.objects.insert(object_id, stored);
-                self.reverse_index.insert(object_id, typed_attrs.clone());
-            } else {
-                self.objects.insert(object_id, obj);
+
+                entries.push((slot as u64, typed_attrs));
             }
 
-            index_entries.push((object_id, typed_attrs));
+            index_entries = entries;
         }
 
         // Phase 2: Parallel index insertion (GIL released)
         let indexes = &self.indexes;
         py.allow_threads(|| {
-            index_entries.par_iter().for_each(|(object_id, typed_attrs)| {
+            index_entries.par_iter().for_each(|(slot_id, typed_attrs)| {
                 for (attr_name, typed_value) in typed_attrs {
                     if let Some(index) = indexes.get(attr_name) {
-                        index.as_index().insert(typed_value.clone(), *object_id);
+                        index.as_index().insert(typed_value.clone(), *slot_id);
                     }
                 }
             });
@@ -780,12 +917,19 @@ impl CollectionManager {
 
     /// Get the total number of objects in the collection
     pub fn size(&self) -> usize {
-        self.objects.len()
+        self.store.lock().len()
+    }
+
+    /// Get the internal slot ID for a Python object (for __contains__ support)
+    pub fn object_slot(&self, obj: PyObject) -> Option<u64> {
+        let ptr_id = obj.as_ptr() as u64;
+        let store = self.store.lock();
+        store.ptr_to_slot.get(&ptr_id).map(|&slot| slot as u64)
     }
 
     /// Clear all objects and indexes (also clears query cache)
     pub fn clear(&self) {
-        self.objects.clear();
+        self.store.lock().clear();
         self.reverse_index.clear();
         for index in self.indexes.iter() {
             index.value().as_index().clear();
@@ -812,15 +956,20 @@ impl CollectionManager {
 
     /// Count alive objects (checks weakrefs in weak_refs mode)
     pub fn alive_count(&self, py: Python<'_>) -> usize {
+        let store = self.store.lock();
         if !self.use_weakrefs {
-            return self.objects.len();
+            return store.len();
         }
-        self.objects.iter()
-            .filter(|entry| {
-                let bound = entry.value().bind(py);
-                match bound.downcast::<PyWeakrefReference>() {
-                    Ok(weakref) => weakref.upgrade().is_some(),
-                    Err(_) => true, // strong ref fallback
+        store.slots.iter()
+            .filter(|slot| {
+                if let Some(ref obj) = slot {
+                    let bound = obj.bind(py);
+                    match bound.downcast::<PyWeakrefReference>() {
+                        Ok(weakref) => weakref.upgrade().is_some(),
+                        Err(_) => true, // strong ref fallback
+                    }
+                } else {
+                    false
                 }
             })
             .count()
@@ -834,22 +983,44 @@ impl CollectionManager {
             return 0;
         }
 
-        let mut dead_ids: Vec<u64> = Vec::new();
-        for entry in self.objects.iter() {
-            let id = *entry.key();
-            let bound = entry.value().bind(py);
-            if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
-                if weakref.upgrade().is_none() {
-                    dead_ids.push(id);
+        // Find dead weakref slots
+        let dead_slots: Vec<u32> = {
+            let store = self.store.lock();
+            store.slots.iter().enumerate()
+                .filter_map(|(i, slot)| {
+                    if let Some(ref obj) = slot {
+                        let bound = obj.bind(py);
+                        if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
+                            if weakref.upgrade().is_none() {
+                                return Some(i as u32);
+                            }
+                        }
+                    }
+                    None
+                })
+                .collect()
+        };
+
+        let count = dead_slots.len();
+        if count > 0 {
+            // Batch remove from store
+            {
+                let mut store = self.store.lock();
+                for &slot in &dead_slots {
+                    store.remove_by_slot(slot);
                 }
             }
-        }
-
-        let count = dead_ids.len();
-        for id in &dead_ids {
-            self.cleanup_single_dead_ref(*id);
-        }
-        if count > 0 {
+            // Clean index entries via reverse_index
+            for &slot in &dead_slots {
+                let slot_id = slot as u64;
+                if let Some((_, attrs)) = self.reverse_index.remove(&slot_id) {
+                    for (attr_name, typed_value) in &attrs {
+                        if let Some(index) = self.indexes.get(attr_name) {
+                            index.as_index().remove(typed_value, slot_id);
+                        }
+                    }
+                }
+            }
             self.query_cache.lock().clear();
         }
         count
@@ -862,7 +1033,7 @@ impl CollectionManager {
         obj: PyObject,
         attributes: HashMap<String, Bound<'_, PyAny>>,
     ) -> PyResult<bool> {
-        let object_id = obj.as_ptr() as u64;
+        let ptr_id = obj.as_ptr() as u64;
 
         // Convert to typed values while GIL is held
         let typed_attrs: Vec<(String, TypedValue)> = attributes.into_iter()
@@ -871,22 +1042,31 @@ impl CollectionManager {
             })
             .collect();
 
+        // Look up slot ID
+        let slot_id = {
+            let store = self.store.lock();
+            match store.ptr_to_slot.get(&ptr_id) {
+                Some(&slot) => slot as u64,
+                None => return Ok(false),
+            }
+        };
+
         // Remove from indexes (GIL released)
         let indexes = &self.indexes;
         py.allow_threads(|| {
             for (attr_name, typed_value) in &typed_attrs {
                 if let Some(index) = indexes.get(attr_name) {
-                    index.as_index().remove(typed_value, object_id);
+                    index.as_index().remove(typed_value, slot_id);
                 }
             }
         });
 
         // Remove from object store (GIL held for safe PyObject drop)
-        let removed = self.objects.remove(&object_id).is_some();
+        let removed = self.store.lock().remove(ptr_id).is_some();
 
         // Remove from reverse index
         if self.use_weakrefs {
-            self.reverse_index.remove(&object_id);
+            self.reverse_index.remove(&slot_id);
         }
 
         // Invalidate cache
@@ -905,25 +1085,30 @@ impl CollectionManager {
             return Ok(0);
         }
 
-        // Phase 1: Convert to typed values (sequential, needs GIL for Bound)
-        let mut typed_batch: Vec<(u64, Vec<(String, TypedValue)>)> = Vec::with_capacity(objects.len());
-        for (obj, attributes) in objects {
-            let object_id = obj.as_ptr() as u64;
-            let typed_attrs: Vec<(String, TypedValue)> = attributes.into_iter()
-                .filter_map(|(name, val)| {
-                    TypedValue::from_py(&val).ok().map(|tv| (name, tv))
-                })
-                .collect();
-            typed_batch.push((object_id, typed_attrs));
+        // Phase 1: Convert to typed values and look up slot IDs (needs GIL)
+        let mut typed_batch: Vec<(u64, u64, Vec<(String, TypedValue)>)> = Vec::with_capacity(objects.len());
+        {
+            let store = self.store.lock();
+            for (obj, attributes) in objects {
+                let ptr_id = obj.as_ptr() as u64;
+                let typed_attrs: Vec<(String, TypedValue)> = attributes.into_iter()
+                    .filter_map(|(name, val)| {
+                        TypedValue::from_py(&val).ok().map(|tv| (name, tv))
+                    })
+                    .collect();
+                if let Some(&slot) = store.ptr_to_slot.get(&ptr_id) {
+                    typed_batch.push((ptr_id, slot as u64, typed_attrs));
+                }
+            }
         }
 
         // Phase 2: Parallel index removal (GIL released)
         let indexes = &self.indexes;
         py.allow_threads(|| {
-            typed_batch.par_iter().for_each(|(object_id, typed_attrs)| {
+            typed_batch.par_iter().for_each(|(_, slot_id, typed_attrs)| {
                 for (attr_name, typed_value) in typed_attrs {
                     if let Some(index) = indexes.get(attr_name) {
-                        index.as_index().remove(typed_value, *object_id);
+                        index.as_index().remove(typed_value, *slot_id);
                     }
                 }
             });
@@ -931,12 +1116,15 @@ impl CollectionManager {
 
         // Phase 3: Remove from object store (sequential, GIL held)
         let mut count = 0;
-        for (object_id, _) in &typed_batch {
-            if self.objects.remove(object_id).is_some() {
-                count += 1;
-            }
-            if self.use_weakrefs {
-                self.reverse_index.remove(object_id);
+        {
+            let mut store = self.store.lock();
+            for (ptr_id, slot_id, _) in &typed_batch {
+                if store.remove(*ptr_id).is_some() {
+                    count += 1;
+                }
+                if self.use_weakrefs {
+                    self.reverse_index.remove(slot_id);
+                }
             }
         }
 
@@ -989,78 +1177,71 @@ impl CollectionManager {
         Ok(result)
     }
 
-    /// Shared helper: convert IDs to Python objects (with weakref support + pre-allocation)
+    /// Shared helper: convert slot IDs to Python objects.
+    /// For large result sets (>256), sorts slot IDs for sequential Vec access.
     #[inline]
     fn ids_to_objects(&self, py: Python<'_>, ids: &[u64]) -> PyResult<Vec<PyObject>> {
+        let store = self.store.lock();
         let mut result = Vec::with_capacity(ids.len());
 
+        // Sort slot IDs for sequential Vec access (cache-friendly)
+        let sorted: Vec<u64>;
+        let lookup_ids: &[u64] = if ids.len() > 256 {
+            sorted = {
+                let mut v = ids.to_vec();
+                v.sort_unstable();
+                v
+            };
+            &sorted
+        } else {
+            ids
+        };
+
         if self.use_weakrefs {
-            let mut dead_ids: Vec<u64> = Vec::new();
-            for &id in ids {
-                match self.resolve_object(py, id) {
-                    Some(obj) => result.push(obj),
-                    None => dead_ids.push(id),
+            let mut dead_slots: Vec<u32> = Vec::new();
+            for &slot_id in lookup_ids {
+                if let Some(obj) = store.slots.get(slot_id as usize).and_then(|s| s.as_ref()) {
+                    let bound = obj.bind(py);
+                    if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
+                        match weakref.upgrade() {
+                            Some(real) => result.push(real.unbind()),
+                            None => dead_slots.push(slot_id as u32),
+                        }
+                    } else {
+                        result.push(obj.clone_ref(py));
+                    }
                 }
             }
-            // Lazy cleanup: remove dead weakrefs from objects + indexes
-            if !dead_ids.is_empty() {
-                for &id in &dead_ids {
-                    self.cleanup_single_dead_ref(id);
+            // Lazy cleanup: remove dead weakrefs
+            if !dead_slots.is_empty() {
+                drop(store);
+                {
+                    let mut store = self.store.lock();
+                    for &slot in &dead_slots {
+                        store.remove_by_slot(slot);
+                    }
+                }
+                for &slot in &dead_slots {
+                    let slot_id = slot as u64;
+                    if let Some((_, attrs)) = self.reverse_index.remove(&slot_id) {
+                        for (attr_name, typed_value) in &attrs {
+                            if let Some(index) = self.indexes.get(attr_name) {
+                                index.as_index().remove(typed_value, slot_id);
+                            }
+                        }
+                    }
                 }
                 self.query_cache.lock().clear();
             }
         } else {
-            for &id in ids {
-                if let Some(entry) = self.objects.get(&id) {
-                    result.push(entry.value().clone_ref(py));
+            for &slot_id in lookup_ids {
+                if let Some(obj) = store.slots.get(slot_id as usize).and_then(|s| s.as_ref()) {
+                    result.push(obj.clone_ref(py));
                 }
             }
         }
 
         Ok(result)
-    }
-
-    /// Resolve a single object ID → PyObject, handling both strong refs and weakrefs.
-    /// Returns None if the weakref is dead (object has been GC'd).
-    #[inline]
-    fn resolve_object(&self, py: Python<'_>, id: u64) -> Option<PyObject> {
-        let entry = self.objects.get(&id)?;
-        let stored = entry.value();
-
-        if self.use_weakrefs {
-            let bound = stored.bind(py);
-            if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
-                return weakref.upgrade().map(|obj| obj.unbind());
-            }
-        }
-        // Strong ref path (default, or fallback for objects that don't support weakrefs)
-        Some(stored.clone_ref(py))
-    }
-
-    /// Remove a dead ref from the object store + all its index entries using the reverse index.
-    fn cleanup_single_dead_ref(&self, id: u64) {
-        self.objects.remove(&id);
-        if let Some((_, attrs)) = self.reverse_index.remove(&id) {
-            for (attr_name, typed_value) in &attrs {
-                if let Some(index) = self.indexes.get(attr_name) {
-                    index.as_index().remove(typed_value, id);
-                }
-            }
-        }
-    }
-
-    /// Check if there's a dead weakref at the given ID and clean it up.
-    /// Used during add_object to handle address reuse.
-    fn maybe_cleanup_dead_ref(&self, py: Python<'_>, id: u64) {
-        if let Some(entry) = self.objects.get(&id) {
-            let bound = entry.value().bind(py);
-            if let Ok(weakref) = bound.downcast::<PyWeakrefReference>() {
-                if weakref.upgrade().is_none() {
-                    drop(entry);
-                    self.cleanup_single_dead_ref(id);
-                }
-            }
-        }
     }
 
     /// Parse a list of Python query spec tuples into QuerySpec enums.
