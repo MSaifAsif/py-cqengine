@@ -14,6 +14,10 @@ python benchmarks/run_all.py                     # Standard run (100K)
 python benchmarks/run_all.py --sizes 10000,100000,500000  # Multi-scale
 python benchmarks/run_all.py --quick             # Fast iteration
 python benchmarks/run_all.py --json              # Save JSON for diffing
+
+# Competitive benchmark (PyCQEngine vs Native Python)
+python benchmarks/competitive/compare.py --sizes 10000,100000,1000000
+python benchmarks/competitive/compare.py --quick --sizes 100000  # Fast iteration
 ```
 
 ---
@@ -21,7 +25,7 @@ python benchmarks/run_all.py --json              # Save JSON for diffing
 ## Current Performance (Latest)
 
 > **Iteration 9 — Dense Vec Object Storage**  
-> **Date:** 2025-07-21  
+> **Date:** 2026-03-09  
 > **Changes:**  
 > - Replaced `DashMap<u64, PyObject>` with `Mutex<DenseStore>` for object storage  
 > - `DenseStore` uses `Vec<Option<PyObject>>` indexed by sequential slot IDs  
@@ -32,7 +36,44 @@ python benchmarks/run_all.py --json              # Save JSON for diffing
 > - Free list for slot reuse on remove operations  
 > - Updated Python `__contains__` to use `object_slot()` for slot-based ID lookup  
 > **Tests:** 119/119 passing  
+> **Build throughput:** ~333K obj/s (unchanged from Iter 8)  
 > **Impact:** 3-6x faster materialization of large result sets. All scenarios now beat Python at 1M.
+
+### 100K Objects — Standard Benchmarks
+
+| Scenario | Median | Results | vs Python | vs Iter8 |
+|----------|--------|---------|-----------|----------|
+| Point lookup (eq VIN) | 0.9 μs | 1 | 2,066x | ~same |
+| count() eq(BRAND) | 0.9 μs | 12,500 | 2,066x | ~same |
+| AND 2-way list() | 64 μs | 4,167 | 30x | **2.7x faster** (was 176μs) |
+| AND 3-way list() | 14 μs | 833 | 143x | **2.5x faster** (was 35μs) |
+| AND 4-way empty | 3.1 μs | 0 | 626x | ~same |
+| OR 2-way list() | 426 μs | 25,000 | 7.5x | **2.5x faster** (was 1,049μs) |
+| OR 3-way list() | 652 μs | 37,500 | 5.5x | **2.4x faster** (was 1,544μs) |
+| IN 3-val list() | 637 μs | 37,500 | 3.7x | **2.4x faster** (was 1,545μs) |
+| gt(PRICE, 40000) list() | 1,060 μs | 59,000 | 1.9x | **2.3x faster** (was 2,428μs) |
+| between(PRICE, 30k-40k) | 343 μs | 21,000 | 9.1x | **2.5x faster** (was 864μs) |
+| between(PRICE, narrow) | 79 μs | 5,000 | 36x | **2.6x faster** (was 208μs) |
+| AND(eq+gt) mixed list() | 136 μs | 8,500 | 14.8x | **2.6x faster** (was 353μs) |
+| Build 100K | 0.29s | — | — | 341K obj/s |
+
+### Multi-Scale Results (PyCQEngine)
+
+| Scenario | 10K | 100K | 1M |
+|----------|-----|------|----|
+| Point lookup (eq VIN) | 0.8μs | 0.9μs | 0.8μs |
+| count() eq(BRAND) | 0.9μs | 0.9μs | 1.2μs |
+| AND 2-way (brand+color) | 7.7μs | 64μs | 1.2ms |
+| AND 3-way (brand+color+yr) | 3.4μs | 14μs | 176μs |
+| AND 4-way (impossible) | 3.2μs | 3.1μs | 3.2μs |
+| OR 2-way (25%) | 37μs | 426μs | 7.5ms |
+| OR 3-way (37.5%) | 58μs | 652μs | 11.9ms |
+| IN 3-val (37.5%) | 54μs | 637μs | 11.8ms |
+| gt(59%) | 89μs | 1.1ms | 16.6ms |
+| between(21%) | 31μs | 343μs | 5.4ms |
+| between(narrow, 5%) | 6.8μs | 79μs | 914μs |
+| AND(eq+gt) mixed | 14μs | 136μs | 2.3ms |
+| Build time | 0.03s | 0.29s | 3.0s |
 
 ### Competitive Benchmark: PyCQEngine vs Native Python (1M Objects)
 
@@ -275,6 +316,7 @@ Per-element cost:  ~11.5 ns/element for Vec<u64> → Python list conversion
 | **6** | Rayon + memory mgmt | OR/IN -20%, remove() | AND regressed 35-40% (FFI roundtrip, not rayon) |
 | **7** | Fused materialize + BTree + general AND | AND **-67%**, OR/IN **-68%**, mixed AND **29x** | Eliminating IDs roundtrip = universal 3x win; general AND for mixed queries |
 | **8** | PyWeakref registry + self-cleaning + pre-alloc | Zero query overhead, gc/alive_count | Weakref branch predicted away on hot path; reverse_index enables O(attrs) cleanup |
+| **9** | Dense Vec object storage | Mat **3-4x faster**, all scenarios beat Python at 1M | DashMap random access was the bottleneck; sequential Vec reads + sorted slot IDs fix it |
 
 **Detailed iteration data:** See "Archived Iteration Details" section below.
 
@@ -286,18 +328,23 @@ Per-element cost:  ~11.5 ns/element for Vec<u64> → Python list conversion
 query_time ≈ index_lookup + (result_count × materialization_cost)
 
 Where:
-  index_lookup ≈ 1-50 μs (hash lookup or BTree range scan)
-  materialization_cost ≈ 0.02 μs per object (fused path, single FFI call)
-  materialization_cost ≈ 0.05-0.10 μs per object (legacy IDs roundtrip)
+  index_lookup    ≈ 1-50 μs (hash lookup or BTree range scan)
+  materialize/obj ≈ 0.015 μs (Dense Vec, sequential slot read + clone_ref)
+  materialize/obj ≈ 0.028 μs (Dense Vec, sorted slot IDs for large results)
+  python_scan/obj ≈ 0.020 μs (native list comprehension, sequential)
 
-Speedup vs Python ≈ (collection_size × 0.02 μs) / query_time
+Speedup vs Python ≈ (collection_size × python_scan/obj) / query_time
+
+Historical (pre-Iter 9):
+  materialize/obj ≈ 0.08-0.11 μs (DashMap random access, Iter 1-8)
+  materialize/obj ≈ 0.05-0.10 μs (legacy IDs roundtrip, pre-Iter 7)
 ```
 
 **Sweet spots:**
-- <1% selectivity: 200-3,000x faster
-- 1-10% selectivity: 20-110x faster
-- 10-30% selectivity: 5-25x faster
-- >50% selectivity: ~1.5-2x faster (materialization dominates)
+- <1% selectivity: 200-6,500x faster
+- 1-10% selectivity: 30-120x faster
+- 10-30% selectivity: 5-31x faster
+- 30-60% selectivity: 1.4-3.2x faster (materialization dominates, Dense Vec still wins)
 - count()/first(): always fast (no materialization)
 - Range count(): 0.7μs regardless of result size (zero-allocation)
 
